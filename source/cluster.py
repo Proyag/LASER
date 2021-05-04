@@ -30,7 +30,7 @@ def WriteBatch(sentences, raw_sentences, cluster_ids, out_file, output_ids=False
 
 
 # Cluster sentences (existing file pointers)
-def ClusterFilep(encoder, raw_inp_file, bpe_inp_file, out_files,
+def ClusterFilep(encoder, raw_inp_file, bpe_inp_file, out_files, centroids_fname,
                  buffer_size=10000, verbose=False, output_ids=False,
                  num_clusters=10, niter=25, nredo=1,
                  min_points_per_centroid=39, max_points_per_centroid=256,
@@ -52,6 +52,7 @@ def ClusterFilep(encoder, raw_inp_file, bpe_inp_file, out_files,
             if n >= max_points_per_centroid * num_clusters:
                 # Train Kmeans
                 kmeans.train(encoded)
+                np.save(centroids_fname, kmeans.centroids, allow_pickle=False)
                 _, cluster_ids = kmeans.index.search(encoded, 1)
                 WriteBatch(sentences, raw_sentences, cluster_ids, out_files, output_ids)
         else:
@@ -80,7 +81,8 @@ def ClusterFile(encoder, raw_fname, bpe_fname, out_fname, inp_encoding='utf-8',
         fout = open(out_fname, mode='w')
     else:
         fout = [open(out_fname + '.cluster_{}'.format(i), mode='w') for i in range(num_clusters)]
-    ClusterFilep(encoder, fin_raw, fin_bpe, fout,
+    centroids_fname = out_fname + '.centroids.npy'
+    ClusterFilep(encoder, fin_raw, fin_bpe, fout, centroids_fname,
                  buffer_size=buffer_size, verbose=verbose, output_ids=output_ids,
                  num_clusters=num_clusters, niter=niter, nredo=nredo,
                  min_points_per_centroid=min_points_per_centroid,
