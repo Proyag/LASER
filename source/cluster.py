@@ -18,12 +18,21 @@ LASER_DIM = 1024
 
 
 # Write clustered sentences to their corresponding output files
-def WriteBatch(sentences, raw_sentences, cluster_ids, out_file, output_ids=False):
-    cluster_ids = cluster_ids.flatten().tolist()
-    assert len(raw_sentences) == len(sentences) == len(cluster_ids), 'Incorrect number of cluster ids/sentences'
+def WriteBatch(sentences, raw_sentences,
+               cluster_dists, cluster_ids,
+               out_file, output_ids=False, output_distances=False):
+    assert len(raw_sentences) == len(sentences) == cluster_ids.shape[0] == cluster_dists.shape[0], \
+        'Incorrect number of cluster ids/sentences'
     if output_ids:
         for cluster_id in cluster_ids:
-            out_file.write(str(cluster_id) + '\n')
+            out_file.write(str(cluster_id[0]) + '\n')
+    elif output_distances:
+        # Need distances corresponding to clusters, instead of sorted ascending like faiss provides
+        for idx, cluster_dist in enumerate(cluster_dists):
+            unsorted_dist = np.empty(cluster_dist.shape)
+            for pos, dist in enumerate(cluster_dist):
+                unsorted_dist[cluster_ids[idx][pos]] = cluster_dist[pos]
+            out_file.write(str(' '.join(str(x) for x in unsorted_dist.tolist())) + '\n')
     else:
         for sentence, raw_sentence, cluster_id in zip(sentences, raw_sentences, cluster_ids):
             out_file[cluster_id].write(raw_sentence + '\n')    
@@ -31,8 +40,10 @@ def WriteBatch(sentences, raw_sentences, cluster_ids, out_file, output_ids=False
 
 # Cluster sentences (existing file pointers)
 def ClusterFilep(encoder, raw_inp_file, bpe_inp_file, out_files, centroids_fname,
-                 buffer_size=10000, verbose=False, output_ids=False,
+                 buffer_size=10000, verbose=False,
+                 output_ids=False, output_distances=False,
                  num_clusters=10, niter=25, nredo=1,
+                 no_reload_centroids=False,
                  min_points_per_centroid=39, max_points_per_centroid=256,
                  spherical=False, update_index=False, gpu_kmeans=False):
     n = 0
@@ -51,13 +62,24 @@ def ClusterFilep(encoder, raw_inp_file, bpe_inp_file, out_files, centroids_fname
             encoded = np.vstack((encoded, encoder.encode_sentences(sentences)))
             if n >= max_points_per_centroid * num_clusters:
                 # Train Kmeans
-                kmeans.train(encoded)
-                np.save(centroids_fname, kmeans.centroids, allow_pickle=False)
-                _, cluster_ids = kmeans.index.search(encoded, 1)
-                WriteBatch(sentences, raw_sentences, cluster_ids, out_files, output_ids)
+                if not no_reload_centroids and os.path.exists(centroids_fname):
+                    print(' - Clustering: Loading centroids from {}'.format(centroids_fname))
+                    centroids_loaded = np.load(centroids_fname)
+                    index = faiss.IndexFlatL2(LASER_DIM)
+                    index.add(centroids_loaded)
+                else:
+                    kmeans.train(encoded)
+                    np.save(centroids_fname, kmeans.centroids, allow_pickle=False)
+                    index = kmeans.index
+                cluster_dists, cluster_ids = index.search(encoded, num_clusters)
+                WriteBatch(sentences, raw_sentences,
+                           cluster_dists, cluster_ids,
+                           out_files, output_ids, output_distances)
         else:
-            _, cluster_ids = kmeans.index.search(encoder.encode_sentences(sentences), 1)
-            WriteBatch(sentences, raw_sentences, cluster_ids, out_files, output_ids)
+            cluster_dists, cluster_ids = index.search(encoder.encode_sentences(sentences), num_clusters)
+            WriteBatch(sentences, raw_sentences,
+                       cluster_dists, cluster_ids,
+                       out_files, output_ids, output_distances)
         if verbose and n % 10000 == 0:
             print('\r - Clustering: {:d} sentences'.format(n), end='')
     if verbose:
@@ -67,8 +89,8 @@ def ClusterFilep(encoder, raw_inp_file, bpe_inp_file, out_files, centroids_fname
 
 # Cluster sentences (file names)
 def ClusterFile(encoder, raw_fname, bpe_fname, out_fname, inp_encoding='utf-8',
-                buffer_size=10000, verbose=False, output_ids=False,
-                num_clusters=10, niter=25, nredo=1,
+                buffer_size=10000, verbose=False, output_ids=False, output_distances=False,
+                num_clusters=10, niter=25, nredo=1, no_reload_centroids=False,
                 min_points_per_centroid=39, max_points_per_centroid=256,
                 spherical=False, update_index=False, gpu_kmeans=False):
     if verbose:
@@ -77,20 +99,21 @@ def ClusterFile(encoder, raw_fname, bpe_fname, out_fname, inp_encoding='utf-8',
                      os.path.basename(out_fname)))
     fin_raw = open(raw_fname, 'r', encoding=inp_encoding, errors='surrogateescape')
     fin_bpe = open(bpe_fname, 'r', encoding=inp_encoding, errors='surrogateescape')
-    if output_ids:
+    if output_ids or output_distances:
         fout = open(out_fname, mode='w')
     else:
         fout = [open(out_fname + '.cluster_{}'.format(i), mode='w') for i in range(num_clusters)]
     centroids_fname = out_fname + '.centroids.npy'
     ClusterFilep(encoder, fin_raw, fin_bpe, fout, centroids_fname,
-                 buffer_size=buffer_size, verbose=verbose, output_ids=output_ids,
+                 buffer_size=buffer_size, verbose=verbose,
+                 output_ids=output_ids, output_distances=output_distances,
                  num_clusters=num_clusters, niter=niter, nredo=nredo,
                  min_points_per_centroid=min_points_per_centroid,
                  max_points_per_centroid=max_points_per_centroid,
                  spherical=spherical, update_index=update_index, gpu_kmeans=gpu_kmeans)
     fin_raw.close()
     fin_bpe.close()
-    if output_ids:
+    if output_ids or output_distances:
         fout.close()
     else:
         for f in fout:
@@ -115,6 +138,8 @@ if __name__ == '__main__':
                              'File to write cluster IDs with --output-cluster-ids-only')
     parser.add_argument('--output-cluster-ids-only', action='store_true',
                         help='Output only cluster IDs instead of writing sentences to separate files')
+    parser.add_argument('--output-cluster-distances-only', action='store_true',
+                        help='Output only distances from each cluster centroid')
     parser.add_argument('--buffer-size', type=int, default=10000,
                         help='Buffer size (sentences)')
     parser.add_argument('--max-tokens', type=int, default=12000,
@@ -142,12 +167,17 @@ if __name__ == '__main__':
     parser.add_argument('--spherical', action='store_true',
                         help='L2 normalize centroids after each iteration')
     parser.add_argument('--update-index', action='store_true',
-                        help='Re-train index after each iteration')                    
+                        help='Re-train index after each iteration')
+    parser.add_argument('--no-reload-centroids', action='store_true',
+                        help='Do not reload existing centroids and force Kmeans retraining')
     args = parser.parse_args()
 
     args.buffer_size = max(args.buffer_size, 1)
     assert not args.max_sentences or args.max_sentences <= args.buffer_size, \
         '--max-sentences/--batch-size cannot be larger than --buffer-size'
+
+    assert not (args.output_cluster_ids_only and args.output_cluster_distances_only), \
+        '--output-cluster-ids-only and --output-cluster-distances-only cannot both be active'
 
     if args.verbose:
         print(' - Encoder: loading {}'.format(args.encoder))
@@ -178,8 +208,11 @@ if __name__ == '__main__':
                     buffer_size=args.buffer_size,
                     verbose=args.verbose,
                     output_ids=args.output_cluster_ids_only,
+                    output_distances=args.output_cluster_distances_only,
                     num_clusters=args.num_clusters,
-                    niter=args.niter, nredo=args.nredo,
+                    niter=args.niter,
+                    nredo=args.nredo,
+                    no_reload_centroids=args.no_reload_centroids,
                     min_points_per_centroid=args.min_points_per_centroid,
                     max_points_per_centroid=args.max_points_per_centroid,
                     spherical=args.spherical,
